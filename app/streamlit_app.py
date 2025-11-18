@@ -1,136 +1,194 @@
-"""
-app/streamlit_app.py
-
-Run:
-    streamlit run app/streamlit_app.py
-"""
-
+# app/streamlit_app.py
 import streamlit as st
 import pandas as pd
+import numpy as np
 import os
+from io import BytesIO
 
-# ---------- Page Config ----------
+# Page config (wide + title)
 st.set_page_config(page_title="Excel Cleaner", layout="wide")
 
-# ---------- Sidebar Settings ----------
+# ---------------- Sidebar Settings ----------------
 st.sidebar.title("Settings")
-
 default_upload_path = st.sidebar.text_input(
-    "Default upload directory",
-    value="",
-    placeholder="Optional: /path/to/upload/folder"
+    "Default upload directory", value="", placeholder="Optional: /path/to/upload/folder"
 )
-
 default_export_path = st.sidebar.text_input(
-    "Default export directory",
-    value="",
-    placeholder="Optional: /path/to/export/folder"
+    "Default export directory", value="", placeholder="Optional: /path/to/export/folder"
 )
-
 st.sidebar.markdown("---")
 
-# ---------- Header with Logo Placeholder ----------
-cols = st.columns([0.2, 2])
-
-with cols[0]:
-    st.write("### Logo Placeholder")
-    # You can replace with:
-    # st.image("your_logo.png", width=120)
-
-with cols[1]:
+# ---------------- Header (logo + title) ----------------
+header_cols = st.columns([0.6, 8])
+with header_cols[0]:
+    # Logo placeholder: put your file at "static/logo.png" (see below)
+    logo_path = "static/logo.png"
+    try:
+        st.image(logo_path, width=120)
+    except Exception:
+        st.write("### Logo")
+with header_cols[1]:
     st.title("Excel Cleaner & Converter")
 
-# ---------- File Upload Section ----------
-uploaded = st.file_uploader("Upload your Excel file", type=["xlsx"])
+# ---------------- Utility: infer types ----------------
+def infer_and_cast(df: pd.DataFrame, datetime_threshold=0.6, numeric_threshold=0.8):
+    """
+    For each column, try to infer if it's datetime, numeric or remain object.
+    If more than numeric_threshold of non-null values convert to numeric.
+    If more than datetime_threshold of non-null values convert to datetime.
+    Returns casted df and a dict with inferred types.
+    """
+    inferred = {}
+    df = df.copy()
+    for col in df.columns:
+        series = df[col]
+        non_null = series.dropna()
+        n = len(non_null)
+        if n == 0:
+            inferred[col] = "empty"
+            continue
+
+        # Try numeric
+        coerced_num = pd.to_numeric(non_null, errors="coerce")
+        num_ok = coerced_num.notna().sum() / n
+
+        # Try datetime
+        coerced_dt = pd.to_datetime(non_null, errors="coerce", infer_datetime_format=True)
+        dt_ok = coerced_dt.notna().sum() / n
+
+        # Decide priority: datetime if strong, else numeric if strong
+        if dt_ok >= datetime_threshold and dt_ok > num_ok:
+            df[col] = pd.to_datetime(df[col], errors="coerce", infer_datetime_format=True)
+            inferred[col] = "datetime"
+        elif num_ok >= numeric_threshold:
+            # if numeric but all ints -> cast to Int64 to preserve NA; else float
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            if pd.api.types.is_integer_dtype(pd.Series(coerced_num.dropna()).dtype):
+                df[col] = df[col].astype("Int64")
+                inferred[col] = "integer"
+            else:
+                inferred[col] = "float"
+        else:
+            # Keep as object/string; strip whitespace
+            if series.dtype == object:
+                df[col] = series.astype(str).replace({"nan": pd.NA})
+                df[col] = df[col].where(~df[col].isin(["nan", "None"]), other=pd.NA)
+                df[col] = df[col].str.strip()
+            inferred[col] = "string"
+    return df, inferred
+
+# ---------------- File upload & processing ----------------
+uploaded = st.file_uploader("Upload your Excel file", type=["xlsx", "xls", "csv"])
 
 if uploaded:
-    # Load
-    df = pd.read_excel(uploaded)
+    # Read intelligently: csv or excel
+    if uploaded.name.lower().endswith(".csv"):
+        df = pd.read_csv(uploaded)
+    else:
+        df = pd.read_excel(uploaded)
 
-    st.subheader("Preview (Top 20 Rows)")
+    st.subheader("Preview (Top 20 rows)")
     st.dataframe(df.head(20), use_container_width=True)
 
-    # ---------- Remove Top Rows ----------
-    top_rows = st.number_input(
-        "Remove top X rows",
-        min_value=0,
-        max_value=len(df),
-        step=1
-    )
-    df_clean = df.iloc[top_rows:].copy()
+    # Remove top rows
+    top_rows = st.number_input("Remove top X rows", min_value=0, max_value=len(df), step=1, value=0)
+    df_clean = df.iloc[top_rows:].reset_index(drop=True).copy()
 
-    # ---------- Use First Row as Header ----------
+    # Use first row as header
     use_first_row = st.checkbox("Use first row as column headers")
-    if use_first_row:
-        df_clean.columns = df_clean.iloc[0]
-        df_clean = df_clean[1:]
+    if use_first_row and len(df_clean) > 0:
+        df_clean.columns = df_clean.iloc[0].astype(str)
+        df_clean = df_clean[1:].reset_index(drop=True)
 
-    st.subheader("Cleaned Preview")
+    st.subheader("After basic header/row cleanup (Top 20)")
     st.dataframe(df_clean.head(20), use_container_width=True)
 
-    # ---------- Column Selection ----------
-    cols_to_keep = st.multiselect(
-        "Select columns to keep",
-        df_clean.columns.tolist(),
-        default=df_clean.columns.tolist()
-    )
-    df_clean = df_clean[cols_to_keep]
+    # Column selection
+    cols_to_keep = st.multiselect("Select columns to keep", df_clean.columns.tolist(), default=df_clean.columns.tolist())
+    if not cols_to_keep:
+        st.warning("Select at least one column.")
+    df_clean = df_clean[cols_to_keep].copy()
 
-    # ---------- Column Stats via Dropdown ----------
+    # ---------------- Automatic type inference ----------------
+    st.subheader("Automatic type inference")
+    infer_button = st.button("Run type inference")
+    if infer_button:
+        with st.spinner("Inferring column types..."):
+            df_inferred, inferred_types = infer_and_cast(df_clean)
+            df_clean = df_inferred
+        st.success("Type inference complete.")
+    else:
+        # Offer to show current simple dtypes if not inferred
+        inferred_types = {c: str(df_clean[c].dtype) for c in df_clean.columns}
+
+    # Show inferred types summary
+    st.write("Inferred column types (click to refresh by running inference):")
+    st.json(inferred_types)
+
+    # ---------------- Column Stats (dropdown) ----------------
     st.subheader("Column Stats")
+    if len(df_clean.columns) > 0:
+        col = st.selectbox("Choose column to inspect", options=df_clean.columns)
+        col_s = df_clean[col]
 
-    if len(cols_to_keep) > 0:
-        selected_col = st.selectbox(
-            "Choose a column to view stats",
-            options=cols_to_keep
-        )
+        # Common metrics
+        cnt = len(col_s)
+        missing = col_s.isna().sum()
+        pct_missing = missing / max(1, cnt)
 
-        if selected_col:
-            col_data = df_clean[selected_col]
+        st.write(f"**{col}** — inferred: `{inferred_types.get(col, str(col_s.dtype))}`")
+        st.write(f"- Count: {cnt}")
+        st.write(f"- Missing: {missing} ({pct_missing:.1%})")
+        st.write(f"- Unique values: {col_s.nunique(dropna=True)}")
 
-            st.write(f"### Stats for: **{selected_col}**")
-            st.write(f"- Data type: `{col_data.dtype}`")
-            st.write(f"- Blanks: `{col_data.isna().sum()}`")
-            st.write(f"- Unique values: `{col_data.nunique()}`")
+        # If numeric: detailed stats
+        if pd.api.types.is_numeric_dtype(col_s):
+            st.write("**Numeric statistics**")
+            # describe returns count, mean, std, min, 25%, 50%, 75%, max
+            desc = col_s.describe().to_frame().T
+            st.table(desc)
 
-            # Category breakdown if low cardinality
-            if col_data.nunique() <= 20:
-                st.write("Top values:")
-                st.write(col_data.value_counts().head(10))
-
-            # Numeric statistics
-            if pd.api.types.is_numeric_dtype(col_data):
-                st.write("Numeric summary:")
-                st.write(col_data.describe())
-
-    # ---------- Export ----------
-    st.subheader("Export File")
-
-    export_type = st.selectbox("Select export format", ["parquet", "csv", "xlsx"])
-
-    if st.button("Download"):
-        # Determine original filename
-        orig_name = os.path.splitext(uploaded.name)[0]
-        cleaned_name = orig_name + "_cleaned"
-
-        # Prepare export path
-        if default_export_path.strip():
-            full_path = os.path.join(default_export_path, cleaned_name)
+            median = col_s.median()
+            st.write(f"- Median: {median}")
+            # Simple histogram (streamlit chart)
+            hist_values = col_s.dropna()
+            if len(hist_values) > 0:
+                st.write("Distribution (histogram):")
+                st.bar_chart(hist_values.value_counts(bins=20).sort_index())
         else:
-            full_path = cleaned_name
+            # Categorical / string stats
+            top = col_s.value_counts(dropna=True).head(10)
+            if len(top) > 0:
+                st.write("Top values:")
+                st.table(top)
 
-        # Output file and Streamlit download
+    # ---------------- Export block ----------------
+    st.subheader("Export")
+    export_type = st.selectbox("Select export format", ["parquet", "csv", "xlsx"])
+    if st.button("Prepare download"):
+        # original name and cleaned suffix
+        orig_name = os.path.splitext(uploaded.name)[0]
+        cleaned_name = f"{orig_name}_cleaned"
+
+        if default_export_path.strip():
+            out_base = os.path.join(default_export_path, cleaned_name)
+        else:
+            out_base = cleaned_name
+
         if export_type == "parquet":
-            outfile = cleaned_name + ".parquet"
-            data = df_clean.to_parquet(index=False)
-            st.download_button("Download Parquet", data=data, file_name=outfile)
+            # write to BytesIO using pyarrow engine
+            buf = BytesIO()
+            df_clean.to_parquet(buf, engine="pyarrow", index=False)
+            buf.seek(0)
+            st.download_button("Download Parquet", data=buf.read(), file_name=out_base + ".parquet", mime="application/octet-stream")
 
         elif export_type == "csv":
-            outfile = cleaned_name + ".csv"
-            data = df_clean.to_csv(index=False).encode()
-            st.download_button("Download CSV", data=data, file_name=outfile)
+            csv_bytes = df_clean.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV", data=csv_bytes, file_name=out_base + ".csv", mime="text/csv")
 
         elif export_type == "xlsx":
-            outfile = cleaned_name + ".xlsx"
-            buffer = df_clean.to_excel(index=False, engine="openpyxl")
-            st.download_button("Download Excel", data=buffer, file_name=outfile)
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df_clean.to_excel(writer, index=False, sheet_name="cleaned")
+            buf.seek(0)
+            st.download_button("Download Excel", data=buf.read(), file_name=out_base + ".xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
